@@ -1,0 +1,82 @@
+name: build
+
+# Upstream ships a prebuilt .uf2 but no CI, and the build instructions are "click Import Project in
+# VS Code". This builds the same firmware headlessly so a source change can actually be turned into
+# a flashable file.
+#
+# TWO variants come out of one source tree, differing only in the BLE connection interval -- the
+# number that IS the input latency (see the comment block in hog_host_demo.c):
+#   _lowlat_7ms5 : 6 units = 7.5 ms, the BLE spec minimum. Flash this one.
+#   _lowlat_15ms : 12 units = 15 ms. Fallback for a peripheral that cannot service an event every
+#                  7.5 ms and responds by stuttering or dropping the link.
+
+on:
+  push:
+    branches: [ main, low-latency ]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -x -e -o pipefail {0}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build build-essential pkg-config libusb-1.0-0-dev \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+          arm-none-eabi-gcc --version
+
+      # "How to build.txt" pins SDK v2.2.0 -- match it exactly, this is a BTstack + cyw43 + TinyUSB
+      # build and those three move together with the SDK.
+      # Init only the submodules the build needs: --recursive would drag in tinyusb's hw/mcu tree,
+      # which is gigabytes and is not used by the RP2040 port.
+      - name: Fetch Pico SDK 2.2.0
+        run: |
+          git clone --branch 2.2.0 --depth 1 https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 \
+            lib/btstack lib/cyw43-driver lib/lwip lib/mbedtls lib/tinyusb
+
+      - name: Build both variants
+        working-directory: ./src_fw/picow_ble_usb_hid_bridge
+        run: |
+          export PICO_SDK_PATH="$HOME/pico-sdk"
+          mkdir -p ../../artifacts
+
+          build_one() {
+            units="$1"; name="$2"
+            cmake -B "build-$name" -DCMAKE_BUILD_TYPE=Release -DLOWLAT_CONN_INTERVAL_UNITS="$units"
+            cmake --build "build-$name" -j"$(nproc)"
+            cp "build-$name/picow_ble_usb_hid_bridge.uf2" \
+               "../../artifacts/picow_ble_usb_hid_bridge_$name.uf2"
+          }
+
+          build_one 6  lowlat_7ms5
+          build_one 12 lowlat_15ms
+
+      # A .uf2 that is missing, empty, or lacking the UF2 magic is worse than a failed build,
+      # because it still gets flashed. First word is UF2_MAGIC_START0 0x0A324655, which on disk is
+      # the bytes "UF2\n" = 55 46 32 0a.
+      - name: Verify artifacts
+        run: |
+          ls -la artifacts/
+          for f in artifacts/*.uf2; do
+            test -s "$f"
+            magic=$(head -c 4 "$f" | xxd -p)
+            test "$magic" = "5546320a"
+            echo "$f OK ($(stat -c%s "$f") bytes)"
+          done
+          sha256sum artifacts/*.uf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: picow_ble_usb_hid_bridge-lowlat-uf2
+          path: artifacts/
+          if-no-files-found: error

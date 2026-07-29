@@ -74,6 +74,78 @@
 #define SCAN_TIMEOUT_MS       5000  // 5 seconds for scanning
 // <=====
 
+// @@lowlat
+// =====>
+/* LOW LATENCY.
+ *
+ * The whole input-lag budget of this bridge is ONE number: the BLE connection interval. A key
+ * press cannot reach the Pico before the peripheral's next connection event, so the interval IS
+ * the added latency -- 0 to 1 interval, averaging half of it. Everything else is already at the
+ * floor: the USB IN endpoint is bInterval=1 (usb_descriptors.c, the fastest full-speed USB
+ * allows) and core 0 drains the report queue as fast as it can spin.
+ *
+ * Stock BTstack asks for 10-30 ms with slave latency 4 (its hci.c defaults) and -- worse -- then
+ * ACCEPTS whatever the peripheral asks for, up to 4 seconds: l2cap.c answers a peripheral's
+ * CONNECTION_PARAMETER_UPDATE_REQUEST automatically, granting anything inside
+ * gap_get_connection_parameter_range(), whose default max is 3200 units. Battery-minded keyboards
+ * and TV remotes routinely ask for 30 ms+ the moment they connect, and the stock build says yes.
+ * So the interval you actually run at is whichever one the peripheral preferred.
+ *
+ * Three changes fix that:
+ *   1. ask for LOWLAT_CONN_INTERVAL_UNITS on the outgoing connection, so the link STARTS there,
+ *   2. narrow the ACCEPTED range to that same value, so a peripheral asking for 30 ms is denied
+ *      (a denial is a normal L2CAP response -- the link stays up on our parameters),
+ *   3. re-assert from the central side if a different interval is ever observed. As central we
+ *      own the link: an LL connection update is a command to the peripheral, not a request.
+ *
+ * 6 units = 7.5 ms is the floor the BLE spec allows. A peripheral that cannot service an event
+ * every 7.5 ms may stutter or drop the link -- that is what the 15 ms build exists for.
+ */
+#ifndef LOWLAT_CONN_INTERVAL_UNITS
+#define LOWLAT_CONN_INTERVAL_UNITS 6    // x1.25ms  -> 7.5 ms, the BLE minimum
+#endif
+#define LOWLAT_CONN_LATENCY        0    // never let the peripheral skip connection events
+#define LOWLAT_SUPERVISION_TIMEOUT 72   // x10ms -> 720 ms (BTstack's default; >> 2x interval)
+#define LOWLAT_INIT_SCAN_INTERVAL  48   // x0.625ms -> 30 ms, while initiating a connection
+#define LOWLAT_INIT_SCAN_WINDOW    48   // window == interval -> 100% duty cycle
+#define LOWLAT_CE_LENGTH           0    // let the controller size the connection event itself
+
+/* Re-asserting is BOUNDED. A peripheral that insists on its own interval must not turn the link
+   into an endless connection-update war on the air -- after this many attempts, keep what we got. */
+#define LOWLAT_MAX_REASSERTS       2
+static uint8_t lowlat_reasserts_left;
+
+#define LOWLAT_UNITS_TO_US(units)  ((uint32_t)(units) * 1250u)
+
+/* UART only -- this build routes stdio to the UART pins, not to USB (the USB port is the HID
+   device). Harmless if nothing is listening, and it is the only way to see the interval you
+   actually negotiated, which is the number that decides your latency. */
+static void lowlat_report_interval(const char * what, uint16_t units, uint16_t latency){
+    uint32_t us = LOWLAT_UNITS_TO_US(units);
+    printf("%s: conn interval %u units = %lu.%02lu ms, slave latency %u\n",
+           what, units,
+           (unsigned long)(us / 1000u), (unsigned long)((us % 1000u) / 10u),
+           latency);
+}
+
+/* Pull an established link down to the target interval. Central-side, so the peripheral has no
+   vote. Does nothing when we are already where we want to be, or once the budget is spent. */
+static void lowlat_enforce(hci_con_handle_t handle, uint16_t observed_units, uint16_t observed_latency){
+    if ((observed_units == LOWLAT_CONN_INTERVAL_UNITS) && (observed_latency == LOWLAT_CONN_LATENCY)) {
+        return;
+    }
+    if (lowlat_reasserts_left == 0) {
+        printf("Low latency: budget spent, staying at %u units\n", observed_units);
+        return;
+    }
+    lowlat_reasserts_left--;
+    printf("Low latency: re-asserting %u units...\n", LOWLAT_CONN_INTERVAL_UNITS);
+    (void)gap_update_connection_parameters(handle,
+                                           LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_UNITS,
+                                           LOWLAT_CONN_LATENCY, LOWLAT_SUPERVISION_TIMEOUT);
+}
+// <=====
+
 // TAG to store remote device address and type in TLV
 #define TLV_TAG_HOGD ((((uint32_t) 'H') << 24 ) | (((uint32_t) 'O') << 16) | (((uint32_t) 'G') << 8) | 'D')
 
@@ -399,10 +471,39 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                     if (app_state != W4_CONNECTED) return;
                     btstack_run_loop_remove_timer(&connection_timer);
                     connection_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
+                    // @@lowlat
+                    // =====>
+                    /* The interval the controller actually settled on. It is normally the one we
+                       asked for, but a peripheral can have been given something else, so measure
+                       rather than assume -- and give every new link a fresh re-assert budget. */
+                    lowlat_reasserts_left = LOWLAT_MAX_REASSERTS;
+                    lowlat_report_interval("Connected",
+                        gap_subevent_le_connection_complete_get_conn_interval(packet),
+                        gap_subevent_le_connection_complete_get_conn_latency(packet));
+                    lowlat_enforce(connection_handle,
+                        gap_subevent_le_connection_complete_get_conn_interval(packet),
+                        gap_subevent_le_connection_complete_get_conn_latency(packet));
+                    // <=====
                     // request security
                     app_state = W4_ENCRYPTED;
                     sm_request_pairing(connection_handle);
                     break;
+                // @@lowlat
+                // =====>
+                /* The link parameters changed under us -- either the peripheral asked and l2cap.c
+                   granted it, or our own re-assert landed. This is the ONLY place the real,
+                   current interval is observable, so it is where the latency is actually decided. */
+                case HCI_EVENT_LE_META:
+                    if (hci_event_le_meta_get_subevent_code(packet) != HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE) break;
+                    if (hci_subevent_le_connection_update_complete_get_status(packet) != ERROR_CODE_SUCCESS) break;
+                    lowlat_report_interval("Parameters updated",
+                        hci_subevent_le_connection_update_complete_get_conn_interval(packet),
+                        hci_subevent_le_connection_update_complete_get_conn_latency(packet));
+                    lowlat_enforce(hci_subevent_le_connection_update_complete_get_connection_handle(packet),
+                        hci_subevent_le_connection_update_complete_get_conn_interval(packet),
+                        hci_subevent_le_connection_update_complete_get_conn_latency(packet));
+                    break;
+                // <=====
                 default:
                     break;
             }
@@ -514,6 +615,33 @@ int btstack_main(int argc, const char * argv[]){
     // <=====
 
     /* LISTING_END */
+
+    // @@lowlat
+    // =====>
+    /* Must happen before the first outgoing connection: these are the parameters that go into the
+       LE Create Connection command itself, so they decide the interval the link STARTS at.
+       cyw43_arch_init() already ran (picow_bt_example_init), so the HCI stack exists. */
+    gap_set_connection_parameters(LOWLAT_INIT_SCAN_INTERVAL, LOWLAT_INIT_SCAN_WINDOW,
+                                  LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_UNITS,
+                                  LOWLAT_CONN_LATENCY, LOWLAT_SUPERVISION_TIMEOUT,
+                                  LOWLAT_CE_LENGTH, LOWLAT_CE_LENGTH);
+
+    /* ...and this is what stops the peripheral undoing it two seconds later. Stock, the accepted
+       range reaches 3200 units (4 s) and l2cap.c grants such a request without asking us. */
+    le_connection_parameter_range_t lowlat_range;
+    gap_get_connection_parameter_range(&lowlat_range);
+    lowlat_range.le_conn_interval_min = LOWLAT_CONN_INTERVAL_UNITS;
+    lowlat_range.le_conn_interval_max = LOWLAT_CONN_INTERVAL_UNITS;
+    lowlat_range.le_conn_latency_min  = LOWLAT_CONN_LATENCY;
+    lowlat_range.le_conn_latency_max  = LOWLAT_CONN_LATENCY;
+    gap_set_connection_parameter_range(&lowlat_range);
+
+    lowlat_reasserts_left = LOWLAT_MAX_REASSERTS;
+    printf("Low-latency build: target conn interval %u units (%lu us), slave latency %u\n",
+           LOWLAT_CONN_INTERVAL_UNITS,
+           (unsigned long)LOWLAT_UNITS_TO_US(LOWLAT_CONN_INTERVAL_UNITS),
+           LOWLAT_CONN_LATENCY);
+    // <=====
 
     // Disable stdout buffering
     setvbuf(stdin, NULL, _IONBF, 0);
