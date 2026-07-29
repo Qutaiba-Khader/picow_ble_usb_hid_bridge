@@ -120,6 +120,14 @@
 #define LOWLAT_CONN_INTERVAL_UNITS 6    // x1.25ms  -> 7.5 ms, the BLE minimum
 #endif
 
+/* Upper end of the interval we will accept. Defaults to the same value, i.e. "give me exactly this".
+ * Widening it matters for a peripheral that holds SEVERAL BLE links at once (a SofaBaton U3 keeps
+ * three): its controller has to fit our connection events between the other links' events, and a
+ * single fixed value leaves it nowhere to put them. A range lets it schedule and still stay fast. */
+#ifndef LOWLAT_CONN_INTERVAL_MAX_UNITS
+#define LOWLAT_CONN_INTERVAL_MAX_UNITS LOWLAT_CONN_INTERVAL_UNITS
+#endif
+
 /* Re-assert the interval after the peripheral has moved it? 0 = accept whatever it wants and never
    touch the link again, which is upstream's behaviour plus a faster start. */
 #ifndef LOWLAT_REASSERT
@@ -169,8 +177,8 @@ static void lowlat_report_interval(const char * what, uint16_t units, uint16_t l
 static void lowlat_enforce(hci_con_handle_t handle, uint16_t observed_units,
                            uint16_t observed_latency, uint16_t observed_timeout){
 #if LOWLAT_REASSERT
-    if (observed_units <= LOWLAT_CONN_INTERVAL_UNITS) {
-        return;                             // already as fast as we wanted, or faster
+    if (observed_units <= LOWLAT_CONN_INTERVAL_MAX_UNITS) {
+        return;                             // already inside the range we asked for, or faster
     }
     if (lowlat_reasserts_left == 0) {
         printf("Low latency: budget spent, staying at %u units\n", observed_units);
@@ -201,7 +209,7 @@ static void lowlat_enforce(hci_con_handle_t handle, uint16_t observed_units,
            (unsigned long) latency, (unsigned long) timeout);
 
     (void)gap_update_connection_parameters(handle,
-                                           LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_UNITS,
+                                           LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_MAX_UNITS,
                                            (uint16_t) latency, (uint16_t) timeout);
 #else
     UNUSED(handle);
@@ -696,7 +704,7 @@ int btstack_main(int argc, const char * argv[]){
        LE Create Connection command itself, so they decide the interval the link STARTS at.
        cyw43_arch_init() already ran (picow_bt_example_init), so the HCI stack exists. */
     gap_set_connection_parameters(LOWLAT_INIT_SCAN_INTERVAL, LOWLAT_INIT_SCAN_WINDOW,
-                                  LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_UNITS,
+                                  LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_MAX_UNITS,
                                   LOWLAT_CONN_LATENCY, LOWLAT_SUPERVISION_TIMEOUT,
                                   LOWLAT_CE_LENGTH, LOWLAT_CE_LENGTH);
 

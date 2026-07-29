@@ -66,6 +66,10 @@ target_include_directories(picow_ble_usb_hid_bridge PRIVATE
 # this bridge (see the comment block in hog_host_demo.c). 6 = 7.5 ms is the BLE spec minimum.
 set(LOWLAT_CONN_INTERVAL_UNITS 6 CACHE STRING "BLE connection interval in 1.25ms units (6 = 7.5ms)")
 
+# Upper end of the interval range. Equal to the min = "give me exactly this". Widen it for a
+# peripheral juggling several BLE links at once, so its controller has somewhere to put our events.
+set(LOWLAT_CONN_INTERVAL_MAX_UNITS ${LOWLAT_CONN_INTERVAL_UNITS} CACHE STRING "Max BLE connection interval in 1.25ms units")
+
 # 1 = re-assert the interval (substituting slave latency) after the peripheral moves it.
 # 0 = accept whatever the peripheral asks for and never touch the link again.
 set(LOWLAT_REASSERT 1 CACHE STRING "Re-assert the connection interval after the peripheral changes it")
@@ -73,6 +77,7 @@ set(LOWLAT_REASSERT 1 CACHE STRING "Re-assert the connection interval after the 
 target_compile_definitions(picow_ble_usb_hid_bridge PRIVATE
     CYW43_LWIP=0
     LOWLAT_CONN_INTERVAL_UNITS=${LOWLAT_CONN_INTERVAL_UNITS}
+    LOWLAT_CONN_INTERVAL_MAX_UNITS=${LOWLAT_CONN_INTERVAL_MAX_UNITS}
     LOWLAT_REASSERT=${LOWLAT_REASSERT}
     )
 pico_btstack_make_gatt_header(picow_ble_usb_hid_bridge PRIVATE 
