@@ -167,9 +167,29 @@ bool send_hid_report(void)
             return bRet;
         }                 
         // If the HID interface is ready, try to send the report
-        if (tud_hid_ready()) {      
+        if (tud_hid_ready()) {
+            /* @@lowlat: SEND THE REPORT ID.
+             *
+             * This used to pass a hardcoded 0, so the report_id that hog_host_demo.c takes such
+             * care to capture from BTstack was written into the queue and never read back out.
+             *
+             * That is invisible on a SINGLE-function peripheral -- a plain mouse or a plain
+             * keyboard has no REPORT_ID item in its descriptor, so BTstack reports id 0 and there
+             * is nothing to send. Both of upstream's verified devices are like that.
+             *
+             * A MULTI-function remote (keyboard + mouse + consumer behind one HID service, which
+             * is what an air-mouse remote is) declares Report IDs, and we hand the PC that same
+             * descriptor verbatim -- so the PC expects every report to begin with its ID byte.
+             * Without it every report is parsed as the wrong kind, and pointer motion is the most
+             * obviously broken by it.
+             *
+             * tud_hid_report() skips the ID field when report_id == 0, so single-function devices
+             * behave exactly as before. */
+            uint16_t max_len = (uint16_t) (CFG_TUD_HID_EP_BUFSIZE - (stHidRpt.report_id ? 1u : 0u));
+            uint16_t send_len = (stHidRpt.report_len > max_len) ? max_len : stHidRpt.report_len;
+
             // Try to send the report
-            if (tud_hid_report(0, stHidRpt.report, stHidRpt.report_len)) {
+            if (tud_hid_report(stHidRpt.report_id, stHidRpt.report, send_len)) {
                 // If sent successfully, remove the report from the queue
                 CMN_AdvanceQueue(CMN_QUE_KIND_HID_RPT);
                 bRet = true;

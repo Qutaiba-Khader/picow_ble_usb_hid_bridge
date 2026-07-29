@@ -67,9 +67,8 @@ jobs:
           #           BLE links at once can still schedule our connection events.
           # nodeny:   the minimal fix -- grant the request and leave the link alone. Isolates the
           #           rejected-parameter-negotiation cause from the forced-update one.
-          build_one 6 6  1 lowlat_balanced
-          build_one 6 12 1 lowlat_range
-          build_one 6 6  0 lowlat_nodeny
+          build_one 6 6 1 lowlat_balanced
+          build_one 6 6 0 lowlat_nodeny
 
       # A .uf2 that is missing, empty, or lacking the UF2 magic is worse than a failed build,
       # because it still gets flashed. First word is UF2_MAGIC_START0 0x0A324655, which on disk is
