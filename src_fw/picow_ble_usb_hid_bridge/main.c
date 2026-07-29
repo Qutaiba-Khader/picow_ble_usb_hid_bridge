@@ -168,28 +168,29 @@ bool send_hid_report(void)
         }                 
         // If the HID interface is ready, try to send the report
         if (tud_hid_ready()) {
-            /* @@lowlat: SEND THE REPORT ID.
+            /* @@lowlat: THE 0 HERE IS CORRECT -- DO NOT "FIX" IT TO stHidRpt.report_id.
              *
-             * This used to pass a hardcoded 0, so the report_id that hog_host_demo.c takes such
-             * care to capture from BTstack was written into the queue and never read back out.
+             * It looks like a dropped value, because hog_host_demo.c carefully stores the report id
+             * from BTstack into ST_HID_RPT and nothing ever reads it back. It is not. BTstack's
+             * GATTSERVICE_SUBEVENT_HID_REPORT payload ALREADY BEGINS WITH THE REPORT ID, so the
+             * buffer we queue is a complete report. Passing 0 tells tud_hid_report() "do not
+             * prepend an id, send this buffer as-is", which is exactly right.
              *
-             * That is invisible on a SINGLE-function peripheral -- a plain mouse or a plain
-             * keyboard has no REPORT_ID item in its descriptor, so BTstack reports id 0 and there
-             * is nothing to send. Both of upstream's verified devices are like that.
+             * Passing stHidRpt.report_id instead prepends the id a SECOND time -- every report goes
+             * out as 01 01 00 ... , the host cannot parse any of it, and the device passes nothing
+             * at all. Tried it; that is precisely what happens. ST_HID_RPT.report_id is vestigial.
              *
-             * A MULTI-function remote (keyboard + mouse + consumer behind one HID service, which
-             * is what an air-mouse remote is) declares Report IDs, and we hand the PC that same
-             * descriptor verbatim -- so the PC expects every report to begin with its ID byte.
-             * Without it every report is parsed as the wrong kind, and pointer motion is the most
-             * obviously broken by it.
+             * Confirmed against hid-remapper's own BLE host, which pushes the same BTstack buffer
+             * straight into an engine that keys off "the report id in the payload".
              *
-             * tud_hid_report() skips the ID field when report_id == 0, so single-function devices
-             * behave exactly as before. */
-            uint16_t max_len = (uint16_t) (CFG_TUD_HID_EP_BUFSIZE - (stHidRpt.report_id ? 1u : 0u));
-            uint16_t send_len = (stHidRpt.report_len > max_len) ? max_len : stHidRpt.report_len;
+             * The clamp is a real guard though: reports are queued with a 512-byte cap but TinyUSB
+             * memcpy()s into a CFG_TUD_HID_EP_BUFSIZE endpoint buffer. */
+            uint16_t send_len = (stHidRpt.report_len > (uint16_t) CFG_TUD_HID_EP_BUFSIZE)
+                                    ? (uint16_t) CFG_TUD_HID_EP_BUFSIZE
+                                    : stHidRpt.report_len;
 
             // Try to send the report
-            if (tud_hid_report(stHidRpt.report_id, stHidRpt.report, send_len)) {
+            if (tud_hid_report(0, stHidRpt.report, send_len)) {
                 // If sent successfully, remove the report from the queue
                 CMN_AdvanceQueue(CMN_QUE_KIND_HID_RPT);
                 bRet = true;
