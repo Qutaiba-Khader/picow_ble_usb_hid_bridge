@@ -91,24 +91,51 @@
  * and TV remotes routinely ask for 30 ms+ the moment they connect, and the stock build says yes.
  * So the interval you actually run at is whichever one the peripheral preferred.
  *
- * Three changes fix that:
+ * TWO changes do that:
  *   1. ask for LOWLAT_CONN_INTERVAL_UNITS on the outgoing connection, so the link STARTS there,
- *   2. narrow the ACCEPTED range to that same value, so a peripheral asking for 30 ms is denied
- *      (a denial is a normal L2CAP response -- the link stays up on our parameters),
- *   3. re-assert from the central side if a different interval is ever observed. As central we
- *      own the link: an LL connection update is a command to the peripheral, not a request.
+ *   2. if the peripheral later moves it, GRANT the request and then quietly re-assert the interval
+ *      from the central side, substituting slave latency so the peripheral's power budget is left
+ *      exactly as it asked for. As central we own the link: an LL connection update is a command
+ *      to the peripheral, not a request.
  *
- * 6 units = 7.5 ms is the floor the BLE spec allows. A peripheral that cannot service an event
- * every 7.5 ms may stutter or drop the link -- that is what the 15 ms build exists for.
+ * ---------------------------------------------------------------------------------------------
+ * DO NOT "FIX" THIS BY NARROWING gap_set_connection_parameter_range().
+ *
+ * That was the first attempt and it BROKE THE LINK. Clamping the accepted range makes l2cap.c
+ * (see its CONNECTION_PARAMETER_UPDATE_REQUEST handler, which answers automatically via
+ * gap_connection_parameter_range_included()) send a REJECT to the peripheral. A great many BLE
+ * peripherals treat a rejected parameter negotiation as fatal and terminate the link -- Nordic's
+ * ble_conn_params module is the common case, and its FIRST_CONN_PARAMS_UPDATE_DELAY is 5000 ms,
+ * which is exactly when the disconnects appeared. Symptom: connects, works, drops ~5 s later,
+ * forever, on any interval setting.
+ *
+ * Rejecting the request is therefore NOT "a normal response the link survives". Grant it, then
+ * override it. Granting is what keeps the peripheral's state machine happy; the override is what
+ * gets us the latency.
+ * ---------------------------------------------------------------------------------------------
+ *
+ * 6 units = 7.5 ms is the floor the BLE spec allows.
  */
 #ifndef LOWLAT_CONN_INTERVAL_UNITS
 #define LOWLAT_CONN_INTERVAL_UNITS 6    // x1.25ms  -> 7.5 ms, the BLE minimum
 #endif
-#define LOWLAT_CONN_LATENCY        0    // never let the peripheral skip connection events
-#define LOWLAT_SUPERVISION_TIMEOUT 72   // x10ms -> 720 ms (BTstack's default; >> 2x interval)
+
+/* Re-assert the interval after the peripheral has moved it? 0 = accept whatever it wants and never
+   touch the link again, which is upstream's behaviour plus a faster start. */
+#ifndef LOWLAT_REASSERT
+#define LOWLAT_REASSERT            1
+#endif
+
+#define LOWLAT_CONN_LATENCY        0    // what we ask for at connect; the peripheral may raise it
+#define LOWLAT_SUPERVISION_TIMEOUT 72   // x10ms -> 720 ms (BTstack's default, unchanged: exonerated
+                                        // as a cause, upstream ran the same value without dropping)
 #define LOWLAT_INIT_SCAN_INTERVAL  48   // x0.625ms -> 30 ms, while initiating a connection
 #define LOWLAT_INIT_SCAN_WINDOW    48   // window == interval -> 100% duty cycle
-#define LOWLAT_CE_LENGTH           0    // let the controller size the connection event itself
+#define LOWLAT_CE_LENGTH           0    // matches BTstack's own default (hci.c), not a change
+
+/* Cap on the slave latency we substitute in. At L=30, I=6 the link still needs a supervision
+   timeout of only ((1+30)*6)/4 = 47 units, well inside the 72 we keep. */
+#define LOWLAT_MAX_SUBSTITUTE_LATENCY 30
 
 /* Re-asserting is BOUNDED. A peripheral that insists on its own interval must not turn the link
    into an endless connection-update war on the air -- after this many attempts, keep what we got. */
@@ -128,21 +155,60 @@ static void lowlat_report_interval(const char * what, uint16_t units, uint16_t l
            latency);
 }
 
-/* Pull an established link down to the target interval. Central-side, so the peripheral has no
-   vote. Does nothing when we are already where we want to be, or once the budget is spent. */
-static void lowlat_enforce(hci_con_handle_t handle, uint16_t observed_units, uint16_t observed_latency){
-    if ((observed_units == LOWLAT_CONN_INTERVAL_UNITS) && (observed_latency == LOWLAT_CONN_LATENCY)) {
-        return;
+/* Pull an established link back down to the target interval WITHOUT costing the peripheral any
+   battery, so it has no reason to fight us again.
+ *
+ * A peripheral that asks for a 30 ms interval is not asking for 30 ms of latency -- it is asking to
+ * keep its radio asleep for 30 ms at a time. Slave latency buys exactly that: with interval 7.5 ms
+ * and latency 3 it may skip 3 events in a row, so it still only has to wake every 30 ms. The
+ * difference is that when it DOES have a keypress it can transmit at the very next 7.5 ms event
+ * instead of waiting up to 30. Same energy, a quarter of the lag.
+ *
+ * Slave latency costs us nothing in the input direction: it only delays host->device traffic, and
+ * this bridge sends none (no LED reports, no feature reports back to the remote). */
+static void lowlat_enforce(hci_con_handle_t handle, uint16_t observed_units,
+                           uint16_t observed_latency, uint16_t observed_timeout){
+#if LOWLAT_REASSERT
+    if (observed_units <= LOWLAT_CONN_INTERVAL_UNITS) {
+        return;                             // already as fast as we wanted, or faster
     }
     if (lowlat_reasserts_left == 0) {
         printf("Low latency: budget spent, staying at %u units\n", observed_units);
         return;
     }
     lowlat_reasserts_left--;
-    printf("Low latency: re-asserting %u units...\n", LOWLAT_CONN_INTERVAL_UNITS);
+
+    // Preserve the peripheral's wake period: interval * (latency + 1) stays the same.
+    uint32_t wake_period = (uint32_t) observed_units * ((uint32_t) observed_latency + 1u);
+    uint32_t latency     = wake_period / (uint32_t) LOWLAT_CONN_INTERVAL_UNITS;
+    latency = (latency > 0u) ? (latency - 1u) : 0u;
+    if (latency > LOWLAT_MAX_SUBSTITUTE_LATENCY) {
+        latency = LOWLAT_MAX_SUBSTITUTE_LATENCY;
+    }
+
+    /* Supervision timeout must exceed 2 * (1 + latency) * interval, i.e. (1+L)*I/4 in 10ms units.
+       Keep whatever the peripheral chose unless that would now be too tight. */
+    uint32_t timeout = observed_timeout;
+    uint32_t floor_units = ((((uint32_t) 1u + latency) * (uint32_t) LOWLAT_CONN_INTERVAL_UNITS) / 4u) + 1u;
+    if (timeout < (floor_units * 2u)) {
+        timeout = floor_units * 2u;
+    }
+    if (timeout < 10u)   { timeout = 10u;   }   // spec minimum
+    if (timeout > 3200u) { timeout = 3200u; }   // spec maximum
+
+    printf("Low latency: %u units/latency %u -> %u units/latency %lu (same wake period), timeout %lu\n",
+           observed_units, observed_latency, LOWLAT_CONN_INTERVAL_UNITS,
+           (unsigned long) latency, (unsigned long) timeout);
+
     (void)gap_update_connection_parameters(handle,
                                            LOWLAT_CONN_INTERVAL_UNITS, LOWLAT_CONN_INTERVAL_UNITS,
-                                           LOWLAT_CONN_LATENCY, LOWLAT_SUPERVISION_TIMEOUT);
+                                           (uint16_t) latency, (uint16_t) timeout);
+#else
+    UNUSED(handle);
+    UNUSED(observed_units);
+    UNUSED(observed_latency);
+    UNUSED(observed_timeout);
+#endif
 }
 // <=====
 
@@ -455,7 +521,13 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                     break;
                 case HCI_EVENT_DISCONNECTION_COMPLETE:
                     connection_handle = HCI_CON_HANDLE_INVALID;
-                    printf("\nDisconnected, starting over...\n");
+                    /* @@lowlat: the REASON discriminates the two ways this goes wrong, and without
+                       it a drop is unattributable. 0x13 = remote user terminated (the peripheral
+                       hung up on us -- typically because it disliked a parameter negotiation);
+                       0x08 = connection timeout (the link actually died on air, i.e. range,
+                       interference, or an interval the peripheral cannot keep up with). */
+                    printf("\nDisconnected (reason 0x%02x), starting over...\n",
+                           hci_event_disconnection_complete_get_reason(packet));
                     
                     // Fix: Ensure timer is cleared upon disconnection before starting over
                     btstack_run_loop_remove_timer(&connection_timer);
@@ -482,7 +554,8 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                         gap_subevent_le_connection_complete_get_conn_latency(packet));
                     lowlat_enforce(connection_handle,
                         gap_subevent_le_connection_complete_get_conn_interval(packet),
-                        gap_subevent_le_connection_complete_get_conn_latency(packet));
+                        gap_subevent_le_connection_complete_get_conn_latency(packet),
+                        gap_subevent_le_connection_complete_get_supervision_timeout(packet));
                     // <=====
                     // request security
                     app_state = W4_ENCRYPTED;
@@ -501,7 +574,8 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
                         hci_subevent_le_connection_update_complete_get_conn_latency(packet));
                     lowlat_enforce(hci_subevent_le_connection_update_complete_get_connection_handle(packet),
                         hci_subevent_le_connection_update_complete_get_conn_interval(packet),
-                        hci_subevent_le_connection_update_complete_get_conn_latency(packet));
+                        hci_subevent_le_connection_update_complete_get_conn_latency(packet),
+                        hci_subevent_le_connection_update_complete_get_supervision_timeout(packet));
                     break;
                 // <=====
                 default:
@@ -626,15 +700,9 @@ int btstack_main(int argc, const char * argv[]){
                                   LOWLAT_CONN_LATENCY, LOWLAT_SUPERVISION_TIMEOUT,
                                   LOWLAT_CE_LENGTH, LOWLAT_CE_LENGTH);
 
-    /* ...and this is what stops the peripheral undoing it two seconds later. Stock, the accepted
-       range reaches 3200 units (4 s) and l2cap.c grants such a request without asking us. */
-    le_connection_parameter_range_t lowlat_range;
-    gap_get_connection_parameter_range(&lowlat_range);
-    lowlat_range.le_conn_interval_min = LOWLAT_CONN_INTERVAL_UNITS;
-    lowlat_range.le_conn_interval_max = LOWLAT_CONN_INTERVAL_UNITS;
-    lowlat_range.le_conn_latency_min  = LOWLAT_CONN_LATENCY;
-    lowlat_range.le_conn_latency_max  = LOWLAT_CONN_LATENCY;
-    gap_set_connection_parameter_range(&lowlat_range);
+    /* The ACCEPTED parameter range is deliberately left at BTstack's wide default, so l2cap.c
+       GRANTS whatever the peripheral asks for. Narrowing it here is what made every build drop the
+       link ~5 s after connecting -- see the DO NOT "FIX" THIS block above before touching it. */
 
     lowlat_reasserts_left = LOWLAT_MAX_REASSERTS;
     printf("Low-latency build: target conn interval %u units (%lu us), slave latency %u\n",

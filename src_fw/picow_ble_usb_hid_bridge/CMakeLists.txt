@@ -63,13 +63,17 @@ target_include_directories(picow_ble_usb_hid_bridge PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     )
 # LOW LATENCY: the BLE connection interval, in 1.25 ms units, is the entire input-lag budget of
-# this bridge (see the comment block in hog_host_demo.c). 6 = 7.5 ms is the BLE spec minimum;
-# 12 = 15 ms is the safe fallback for a peripheral that cannot service an event every 7.5 ms.
+# this bridge (see the comment block in hog_host_demo.c). 6 = 7.5 ms is the BLE spec minimum.
 set(LOWLAT_CONN_INTERVAL_UNITS 6 CACHE STRING "BLE connection interval in 1.25ms units (6 = 7.5ms)")
+
+# 1 = re-assert the interval (substituting slave latency) after the peripheral moves it.
+# 0 = accept whatever the peripheral asks for and never touch the link again.
+set(LOWLAT_REASSERT 1 CACHE STRING "Re-assert the connection interval after the peripheral changes it")
 
 target_compile_definitions(picow_ble_usb_hid_bridge PRIVATE
     CYW43_LWIP=0
     LOWLAT_CONN_INTERVAL_UNITS=${LOWLAT_CONN_INTERVAL_UNITS}
+    LOWLAT_REASSERT=${LOWLAT_REASSERT}
     )
 pico_btstack_make_gatt_header(picow_ble_usb_hid_bridge PRIVATE 
     ${CMAKE_CURRENT_LIST_DIR}/hog_host_demo.gatt

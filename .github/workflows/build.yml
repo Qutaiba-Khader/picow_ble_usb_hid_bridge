@@ -51,15 +51,20 @@ jobs:
           mkdir -p ../../artifacts
 
           build_one() {
-            units="$1"; name="$2"
-            cmake -B "build-$name" -DCMAKE_BUILD_TYPE=Release -DLOWLAT_CONN_INTERVAL_UNITS="$units"
+            units="$1"; reassert="$2"; name="$3"
+            cmake -B "build-$name" -DCMAKE_BUILD_TYPE=Release \
+                  -DLOWLAT_CONN_INTERVAL_UNITS="$units" -DLOWLAT_REASSERT="$reassert"
             cmake --build "build-$name" -j"$(nproc)"
             cp "build-$name/picow_ble_usb_hid_bridge.uf2" \
                "../../artifacts/picow_ble_usb_hid_bridge_$name.uf2"
           }
 
-          build_one 6  lowlat_7ms5
-          build_one 12 lowlat_15ms
+          # balanced: grant the peripheral's request, then re-assert 7.5 ms with slave latency
+          #           substituted in so its power budget is untouched.
+          # nodeny:   the minimal fix -- grant the request and leave the link alone. Isolates the
+          #           rejected-parameter-negotiation cause from the forced-update one.
+          build_one 6 1 lowlat_balanced
+          build_one 6 0 lowlat_nodeny
 
       # A .uf2 that is missing, empty, or lacking the UF2 magic is worse than a failed build,
       # because it still gets flashed. First word is UF2_MAGIC_START0 0x0A324655, which on disk is
